@@ -1,0 +1,17 @@
+faiss-gpu==1.7.2
+fire==0.7.0
+func-timeout==4.3.5
+google-api-python-client==2.158.0
+importlib-metadata==8.0.0
+importlib-resources==6.4.0
+jaraco.collections==5.1.0
+lmdb==1.4.1
+ml-collections==1.0.0
+pip-chill==1.0.3
+seaborn==0.13.2
+sentence-transformers==3.3.1
+sentencepiece==0.2.0
+tomli==2.0.1
+torchvision==0.20.1
+wandb==0.19.6
+wget==3.2

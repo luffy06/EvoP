@@ -1,0 +1,206 @@
+import os, sys
+for i, sys_path in enumerate(sys.path):
+    if sys_path == os.path.dirname(__file__):
+        sys.path[i] = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+
+import json
+import fire
+import copy
+import time
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+
+from comparisons.sleb.utils.model_utils import get_llm
+from comparisons.sleb.utils.onoff_utils.onoff import block_replace, turn_off, turn_on
+from utils.data_utils import *
+from utils.block_remove import block_remove
+from utils.eval_utils import load_and_eval_ppl, eval_zero_shot
+from transformers import set_seed
+
+@torch.no_grad()
+def get_loss(model, testenc, bs=1, device=None):
+    # # Get input IDs
+    # testenc = testenc.input_ids
+
+    # Calculate number of samples
+    # nsamples = len(testenc)
+  
+    # List to store negative log likelihoods
+    losses = []
+
+    # Loop through each batch
+    for inputs in testenc:
+
+        # # Calculate end index
+        # j = min(i+bs, nsamples)
+
+        # # Prepare inputs and move to device
+        # inputs = testenc[:,(i * model.seqlen):(j * model.seqlen)].to(device)
+        # inputs = inputs.reshape(j-i, model.seqlen)
+        inputs = inputs.view(1, -1).to(device)
+
+        # Forward pass through the model
+        lm_logits = model(inputs).logits
+
+        # Shift logits and labels for next token prediction
+        shift_logits = lm_logits[:, :-1, :].contiguous()
+        shift_labels = inputs[:, 1:]
+
+        # Compute loss
+        loss_fct = nn.CrossEntropyLoss()
+        loss = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1))
+
+        # Calculate negative log likelihood
+        loss = loss.float() * model.seqlen
+
+        # Append to list of negative log likelihoods
+        losses.append(loss)
+
+    # Compute sum of negative log_likelihood
+    loss_sum = torch.stack(losses).sum()
+
+    return loss_sum.item()
+
+
+def sleb(
+        model_name: str = 'meta-llama/Llama-2-7b-hf',
+        num_blocks: int = 32,
+        num_remove_blocks: int = 7,
+        early_barrier: int = 1,
+        latter_barrier: int = 1,
+        seed: int = 0,
+        data_log_path: str = 'data_sleb.json',
+        result_folder: str = 'sleb_results',
+        result_file: str = 'sleb_results.txt',
+        dataset: str = 'wikitext2',
+        eval_ppl: bool = True,
+        eval_zeroshot: bool = False
+):
+    set_seed(seed)
+    data_configs = json.load(open(data_log_path, "r"))
+    tokenizer = get_tokenizer(model_name)
+    dataloader_list = get_trainloaders(dataset, 
+                                  seed=seed,
+                                  tokenizer=tokenizer,
+                                  **data_configs
+    )
+    print(f"Dataloader({dataset}) loaded.")
+    assert len(dataloader_list) > 1
+    for cid, dataloader in enumerate(dataloader_list):
+        print(f"Number of tokens in dataloader for cluster {cid}: {np.sum([x.numel() for x in dataloader_list])}")
+
+        alive_list = [i for i in range(num_blocks)]
+        removal_list = []
+
+        model = get_llm(model_name)
+        use_cache = model.config.use_cache
+        model.config.use_cache = False
+    
+        # replace
+        model = block_replace(model)
+        model.eval()
+
+        print(f"Loaded Model: {model.name}")
+        min_loss = np.inf
+        # check start time
+        start_point = time.time()
+        for i in range(num_remove_blocks):
+
+            phase_start_point = time.time()
+            print(f"Phase {i+1} of {num_remove_blocks}")
+
+            min_loss = 1e99
+            min_loss_idx = -1
+
+            search_bound = num_blocks - i
+
+            for j in range(early_barrier, search_bound-latter_barrier):
+
+                # kill j-th alive block
+                turn_off(model, alive_list[j])
+
+                loss = get_loss(model, dataloader, bs=1, device=torch.device("cuda:0"))
+                torch.cuda.empty_cache()
+                
+                if loss < min_loss:
+                    min_loss = loss
+                    min_loss_idx = j
+
+                print(
+                    f"[Block {j} (Original block {alive_list[j]}) removed] Loss={loss:.3f}, Current Min Loss={min_loss:.3f} / Layer {alive_list[min_loss_idx]}"
+                )
+                # unkill j-th alive block
+                turn_on(model, alive_list[j])
+
+            
+            phase_finish_point = time.time()
+            phase_time_elapsed = phase_finish_point -  phase_start_point
+
+            # remove block causing the least snlls increase
+            print(f"Phase_time_elapsed (s): {phase_time_elapsed}")
+            print(f"[SELECTED block {min_loss_idx} (Originally block {alive_list[min_loss_idx]})] Loss={min_loss:.3f}")      
+
+            turn_off(model, alive_list[min_loss_idx])
+            removal_list.append(alive_list[min_loss_idx])
+            print(f"Current Block Removal List: {removal_list}")
+            del alive_list[min_loss_idx]
+        
+        finish_point = time.time()
+        time_elapsed = finish_point - start_point
+
+        print(
+            f"Time_Elapsed: {time_elapsed}\n"
+            f"Model Name: {model_name}\n"
+            f"# Total Blocks: {num_blocks}\n"
+            f"# Remove Blocks: {num_remove_blocks}\n"
+            f"Dataset: {dataset}\n"
+            f"Seed: {seed}\n" 
+            f"Barriers: early {early_barrier} / latter {latter_barrier}\n" 
+            f"Block Removal Order: {removal_list}\n"
+            f"Final Loss: {min_loss}\n"
+        )
+        model = block_remove(model, copy.deepcopy(removal_list))
+
+        if eval_ppl:
+            print(f"Starting PPL evaluation...")
+            model.config.use_cache = use_cache
+
+            w2_ppl = load_and_eval_ppl(model, device=torch.device("cuda:0"), dataset='wikitext2')
+            print(f"WikiText-2 PPL = {w2_ppl:.2f}")
+
+            # c4_ppl = load_and_eval_ppl(model, device=torch.device("cuda:0"), dataset='c4')
+            # print(f"C4 PPL = {c4_ppl:.2f}")
+
+        
+        if not os.path.exists(os.path.join(result_folder, f"cluster-{cid}")):
+            os.makedirs(os.path.join(result_folder, f"cluster-{cid}"))
+        
+        result_path = os.path.join(os.path.join(result_folder, f"cluster-{cid}"), result_file)
+
+        with open(result_path, 'a') as file:
+            sentences = []
+            sentences.append(f"Cluster ID: {cid}\n")
+            sentences.append(f"Time Elapsed: {time_elapsed}\n")
+            sentences.append(f"Model Name: {model_name}\n")
+            sentences.append(f"# Total Blocks: {num_blocks}\n")
+            sentences.append(f"# Remove Blocks: {num_remove_blocks}\n")
+            sentences.append(f"Dataset: {dataset}\n")
+            sentences.append(f"Seed: {seed}\n") 
+            sentences.append(f"Barriers: early {early_barrier} / latter {latter_barrier}\n")
+            sentences.append(f"Block Removal Order: {removal_list}\n")
+            sentences.append(f"Final Loss: {min_loss}\n")
+
+            if eval_ppl:
+                sentences.append(f"WikiText-2 PPL = {w2_ppl:.2f}\n")
+                # sentences.append(f"C4 PPL = {c4_ppl:.2f}\n")
+
+            sentences.append("\n")
+
+                                
+            for sentence in sentences:
+                file.write(sentence)
+
+if __name__ == "__main__":
+    fire.Fire(sleb)
