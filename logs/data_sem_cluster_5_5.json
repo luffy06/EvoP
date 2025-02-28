@@ -1,0 +1,10 @@
+{
+    "sample_strategy": "clustering",
+    "ndata": 5,
+    "data_max_seq_len": 2048,
+    "data_grain": "sample",
+    "semantic_chunk": true,
+    "nsentences": 60,
+    "nclusters": 5,
+    "return_in_clusters": false
+}
